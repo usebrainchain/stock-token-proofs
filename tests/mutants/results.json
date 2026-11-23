@@ -1,0 +1,520 @@
+[
+ {
+  "id": "M01",
+  "property": "P1",
+  "change": "mint credits one unit more than requested",
+  "unit": [
+   "P1SupplyTest.testFuzz_adminBurnRemovesExactly",
+   "P1SupplyTest.testFuzz_burnRemovesExactly",
+   "P1SupplyTest.testFuzz_mintAddsExactly",
+   "P1SupplyTest.test_burnBeyondBalanceReverts",
+   "P1SupplyTest.test_burnNeedsNoAllowanceFromTheHolder",
+   "P1SupplyTest.test_mintOverflowReverts"
+  ],
+  "invariant": [
+   "invariant_P1_supplyIsMintedLessBurned"
+  ],
+  "halmos": [
+   "P1SupplyHalmos.check_mint_addsExactlyAmount"
+  ],
+  "cross": [
+   "P2",
+   "P3",
+   "P4",
+   "P5",
+   "P7"
+  ],
+  "seconds": 66,
+  "killed": true
+ },
+ {
+  "id": "M02",
+  "property": "P1",
+  "change": "adminBurn moves the tokens to the token contract instead of burning them",
+  "unit": [
+   "P1SupplyTest.testFuzz_adminBurnRemovesExactly"
+  ],
+  "invariant": [
+   "invariant_P1_balancesSumToTotalSupply",
+   "invariant_P1_supplyIsMintedLessBurned"
+  ],
+  "halmos": [
+   "P1SupplyHalmos.check_adminBurn_removesExactlyAmount"
+  ],
+  "cross": [
+   "P3",
+   "P5"
+  ],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M03",
+  "property": "P1",
+  "change": "every non-zero transfer also inflates totalSupply by one unit",
+  "unit": [
+   "P1SupplyTest.test_nonSupplyFunctionsLeaveSupplyAlone"
+  ],
+  "invariant": [
+   "invariant_P1_balancesSumToTotalSupply",
+   "invariant_P1_supplyIsMintedLessBurned"
+  ],
+  "halmos": [
+   "P1SupplyHalmos.check_onlyMintAndBurnsChangeSupply"
+  ],
+  "cross": [
+   "P5",
+   "P7"
+  ],
+  "seconds": 55,
+  "killed": true
+ },
+ {
+  "id": "M04",
+  "property": "P2",
+  "change": "transfer no longer checks the recipient against the blocklist",
+  "unit": [
+   "P2BlocklistTest.testFuzz_blockedBalanceOnlyFallsThroughAdminBurn",
+   "P2BlocklistTest.test_transfer_blockedRecipient"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P2_blockedBalancesOnlyFallByAdminBurn"
+  ],
+  "halmos": [
+   "P2BlocklistHalmos.check_onlyAdminBurnTouchesABlockedAccount",
+   "P2BlocklistHalmos.check_transfer_refusesBlockedParties"
+  ],
+  "cross": [],
+  "seconds": 59,
+  "killed": true
+ },
+ {
+  "id": "M05",
+  "property": "P2",
+  "change": "transferFrom no longer checks the spender (caller) against the blocklist",
+  "unit": [
+   "P2BlocklistTest.test_transferFrom_blockedSpender"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P2_blockedBalancesOnlyFallByAdminBurn"
+  ],
+  "halmos": [
+   "P2BlocklistHalmos.check_onlyAdminBurnTouchesABlockedAccount",
+   "P2BlocklistHalmos.check_transferFrom_refusesBlockedParties"
+  ],
+  "cross": [],
+  "seconds": 56,
+  "killed": true
+ },
+ {
+  "id": "M06",
+  "property": "P2",
+  "change": "burn no longer checks the holder against the blocklist",
+  "unit": [
+   "P2BlocklistTest.testFuzz_blockedBalanceOnlyFallsThroughAdminBurn",
+   "P2BlocklistTest.test_burn_blockedHolder"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P2_blockedBalancesOnlyFallByAdminBurn"
+  ],
+  "halmos": [
+   "P2BlocklistHalmos.check_burn_refusesBlockedParties",
+   "P2BlocklistHalmos.check_onlyAdminBurnTouchesABlockedAccount"
+  ],
+  "cross": [],
+  "seconds": 63,
+  "killed": true
+ },
+ {
+  "id": "M07",
+  "property": "P2",
+  "change": "approve no longer checks the spender against the blocklist",
+  "unit": [
+   "P2BlocklistTest.test_approve_blockedSpender"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P2_blockedBalancesOnlyFallByAdminBurn"
+  ],
+  "halmos": [
+   "P2BlocklistHalmos.check_approve_refusesBlockedParties",
+   "P2BlocklistHalmos.check_onlyAdminBurnTouchesABlockedAccount"
+  ],
+  "cross": [],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M08",
+  "property": "P2",
+  "change": "adminBurn refuses blocked holders (it must reach them)",
+  "unit": [
+   "P2BlocklistTest.test_adminBurn_ignoresBlockedCaller",
+   "P2BlocklistTest.test_adminBurn_ignoresBlockedHolder"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P2_blockedBalancesOnlyFallByAdminBurn"
+  ],
+  "halmos": [
+   "P2BlocklistHalmos.check_adminBurn_ignoresTheBlocklist"
+  ],
+  "cross": [
+   "P3"
+  ],
+  "seconds": 61,
+  "killed": true
+ },
+ {
+  "id": "M09",
+  "property": "P3",
+  "change": "transfer ignores the pause",
+  "unit": [
+   "P3PauseTest.test_bothPausedRevertsGatedCalls",
+   "P3PauseTest.test_pausesAreIndependent",
+   "P3PauseTest.test_registryPauseRevertsGatedCalls",
+   "P3PauseTest.test_tokenPauseRevertsGatedCalls"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P3_pauseGatesExactlyTheListedCalls"
+  ],
+  "halmos": [
+   "P3PauseHalmos.check_gatedCallsRevertWhilePaused",
+   "P3PauseHalmos.check_whilePausedOnlyAdminBurnMovesValue"
+  ],
+  "cross": [],
+  "seconds": 60,
+  "killed": true
+ },
+ {
+  "id": "M10",
+  "property": "P3",
+  "change": "paused() ignores the registry pause",
+  "unit": [
+   "P3PauseTest.testFuzz_adminBurnStaysAvailable",
+   "P3PauseTest.test_pausesAreIndependent",
+   "P3PauseTest.test_registryPauseCoversEveryToken",
+   "P3PauseTest.test_registryPauseRevertsGatedCalls"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P3_pauseGatesExactlyTheListedCalls"
+  ],
+  "halmos": [
+   "P3PauseHalmos.check_pausedIsEitherFlag"
+  ],
+  "cross": [],
+  "seconds": 57,
+  "killed": true
+ },
+ {
+  "id": "M11",
+  "property": "P3",
+  "change": "adminBurn is stopped by the pause (it must stay available)",
+  "unit": [
+   "P3PauseTest.testFuzz_adminBurnStaysAvailable"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P3_pauseGatesExactlyTheListedCalls"
+  ],
+  "halmos": [
+   "P3PauseHalmos.check_adminBurn_availableWhilePaused"
+  ],
+  "cross": [
+   "P2"
+  ],
+  "seconds": 61,
+  "killed": true
+ },
+ {
+  "id": "M12",
+  "property": "P3",
+  "change": "permit ignores the pause",
+  "unit": [
+   "P3PauseTest.test_bothPausedRevertsGatedCalls",
+   "P3PauseTest.test_pausesAreIndependent",
+   "P3PauseTest.test_registryPauseRevertsGatedCalls",
+   "P3PauseTest.test_tokenPauseRevertsGatedCalls"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P3_pauseGatesExactlyTheListedCalls"
+  ],
+  "halmos": [
+   "P3PauseHalmos.check_gatedCallsRevertWhilePaused",
+   "P3PauseHalmos.check_whilePausedOnlyAdminBurnMovesValue"
+  ],
+  "cross": [],
+  "seconds": 60,
+  "killed": true
+ },
+ {
+  "id": "M13",
+  "property": "P4",
+  "change": "a scheduled multiplier applies one second after its time",
+  "unit": [
+   "P4MultiplierTest.testFuzz_scheduledAppliesExactlyFromItsTime",
+   "P4MultiplierTest.testFuzz_updateLeavesRawAccountingAlone",
+   "P4MultiplierTest.test_immediateFormTakesEffectInTheSameBlock",
+   "P4MultiplierTest.test_reschedulingAfterMaturityKeepsTheMaturedValueUntilTheNextTime",
+   "P4MultiplierTest.test_reschedulingBeforeMaturityCancelsThePendingValue",
+   "P4MultiplierTest.test_transferEventCarriesTheScaledValue"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P4_multiplierFollowsTheSchedule"
+  ],
+  "halmos": [
+   "P4MultiplierHalmos.check_immediateFormAppliesNow",
+   "P4MultiplierHalmos.check_scheduleAppliesExactlyFromItsTime"
+  ],
+  "cross": [
+   "P3"
+  ],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M14",
+  "property": "P4",
+  "change": "rescheduling does not save the multiplier in force, so a matured value is lost",
+  "unit": [
+   "P4MultiplierTest.test_reschedulingAfterMaturityKeepsTheMaturedValueUntilTheNextTime"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P4_multiplierFollowsTheSchedule"
+  ],
+  "halmos": [
+   "P4MultiplierHalmos.check_scheduleAppliesExactlyFromItsTime"
+  ],
+  "cross": [],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M15",
+  "property": "P4",
+  "change": "updateMultiplier accepts zero",
+  "unit": [
+   "P4MultiplierTest.test_zeroMultiplierReverts"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P4_multiplierFollowsTheSchedule"
+  ],
+  "halmos": [
+   "P4MultiplierHalmos.check_immediateFormAppliesNow",
+   "P4MultiplierHalmos.check_scheduleAppliesExactlyFromItsTime",
+   "P4MultiplierHalmos.check_updateRejectsZeroAndPast"
+  ],
+  "cross": [],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M16",
+  "property": "P4",
+  "change": "an unset multiplier reads as zero instead of 1.0",
+  "unit": [
+   "P4MultiplierTest.testFuzz_scheduledAppliesExactlyFromItsTime",
+   "P4MultiplierTest.test_defaults",
+   "P4MultiplierTest.test_reschedulingBeforeMaturityCancelsThePendingValue",
+   "P4MultiplierTest.test_scheduleAtMaxTimeNeverApplies"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P4_multiplierFollowsTheSchedule"
+  ],
+  "halmos": [
+   "P4MultiplierHalmos.check_uiMultiplierNeverZero"
+  ],
+  "cross": [
+   "P3"
+  ],
+  "seconds": 47,
+  "killed": true
+ },
+ {
+  "id": "M17",
+  "property": "P4",
+  "change": "the immediate multiplier update also rescales the raw totalSupply",
+  "unit": [
+   "P4MultiplierTest.testFuzz_updateLeavesRawAccountingAlone"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P4_multiplierFollowsTheSchedule"
+  ],
+  "halmos": [
+   "P4MultiplierHalmos.check_updateLeavesRawStateAlone"
+  ],
+  "cross": [
+   "P1"
+  ],
+  "seconds": 65,
+  "killed": true
+ },
+ {
+  "id": "M18",
+  "property": "P5",
+  "change": "setMetadata has no role check",
+  "unit": [
+   "P5RolesTest.testFuzz_tokenFunctionsRevertWithoutTheRole",
+   "P5RolesTest.test_otherRoleHoldersAreRefused"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P5_rolesGateEveryPrivilegedCall"
+  ],
+  "halmos": [
+   "P5RolesHalmos.check_setMetadata",
+   "P5RolesHalmos.check_unprivilegedCallerCannotTouchAdminState"
+  ],
+  "cross": [],
+  "seconds": 53,
+  "killed": true
+ },
+ {
+  "id": "M19",
+  "property": "P5",
+  "change": "pauseOracle checks TOKEN_PAUSER_ROLE instead of ORACLE_PAUSER_ROLE",
+  "unit": [
+   "P5RolesTest.testFuzz_tokenFunctionsRevertWithoutTheRole",
+   "P5RolesTest.test_holdersCanCallTheirFunctions",
+   "P5RolesTest.test_otherRoleHoldersAreRefused"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P5_rolesGateEveryPrivilegedCall"
+  ],
+  "halmos": [
+   "P5RolesHalmos.check_pauseOracle"
+  ],
+  "cross": [
+   "P1",
+   "P2",
+   "P3"
+  ],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M20",
+  "property": "P5",
+  "change": "adminBurn accepts BURNER_ROLE",
+  "unit": [
+   "P5RolesTest.testFuzz_tokenFunctionsRevertWithoutTheRole",
+   "P5RolesTest.test_aRoleCoversEveryTokenOnTheRegistry",
+   "P5RolesTest.test_holdersCanCallTheirFunctions",
+   "P5RolesTest.test_otherRoleHoldersAreRefused"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P5_rolesGateEveryPrivilegedCall"
+  ],
+  "halmos": [
+   "P5RolesHalmos.check_adminBurn"
+  ],
+  "cross": [
+   "P1",
+   "P2",
+   "P3"
+  ],
+  "seconds": 61,
+  "killed": true
+ },
+ {
+  "id": "M21",
+  "property": "P6",
+  "change": "the implementation constructor no longer disables initializers",
+  "unit": [
+   "P6InitTest.testFuzz_implementationCannotBeInitialised",
+   "P6InitTest.test_implementationInitializersAreDisabledForever"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P6_initialisedExactlyOnce"
+  ],
+  "halmos": [
+   "P6InitHalmos.check_implementationNeverInitialises"
+  ],
+  "cross": [],
+  "seconds": 62,
+  "killed": true
+ },
+ {
+  "id": "M22",
+  "property": "P6",
+  "change": "initialize is a reinitializer keyed on the uid, so a proxy can be initialised again",
+  "unit": [
+   "P6InitTest.testFuzz_proxyInitialisesOnce",
+   "P6InitTest.test_anUninitialisedProxyCanBeInitialisedByAnyoneOnce",
+   "P6InitTest.test_constructorExemptionAllowsRepeatedInitialisationBeforeCodeExists"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P6_initialisedExactlyOnce"
+  ],
+  "halmos": [
+   "P6InitHalmos.check_noCallResetsTheProxyInitialisedFlag",
+   "P6InitHalmos.check_proxyInitialisesAtMostOnce"
+  ],
+  "cross": [
+   "P2",
+   "P3",
+   "P5"
+  ],
+  "seconds": 59,
+  "killed": true
+ },
+ {
+  "id": "M23",
+  "property": "P7",
+  "change": "transferFrom does not spend the allowance",
+  "unit": [
+   "P7TransfersTest.testFuzz_transferFromSpendsExactlyValue",
+   "P7TransfersTest.test_ownerMovingOwnTokensThroughTransferFromNeedsAllowance",
+   "P7TransfersTest.test_transferFromBeyondAllowanceReverts"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P7_balancesAllowancesAndNoncesMatchTheModel"
+  ],
+  "halmos": [
+   "P7TransfersHalmos.check_transferFrom_movesAndSpendsExactly"
+  ],
+  "cross": [],
+  "seconds": 53,
+  "killed": true
+ },
+ {
+  "id": "M24",
+  "property": "P7",
+  "change": "an infinite (2^256-1) allowance is spent like a finite one",
+  "unit": [
+   "P7TransfersTest.testFuzz_infiniteAllowanceIsNotSpent"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P7_balancesAllowancesAndNoncesMatchTheModel"
+  ],
+  "halmos": [
+   "P7TransfersHalmos.check_transferFrom_movesAndSpendsExactly"
+  ],
+  "cross": [],
+  "seconds": 54,
+  "killed": true
+ },
+ {
+  "id": "M25",
+  "property": "P7",
+  "change": "transfers skim one unit to a third account",
+  "unit": [
+   "P7TransfersTest.testFuzz_infiniteAllowanceIsNotSpent",
+   "P7TransfersTest.testFuzz_selfTransferChangesNothing",
+   "P7TransfersTest.testFuzz_transferFromSpendsExactlyValue",
+   "P7TransfersTest.testFuzz_transferMovesExactlyValue",
+   "P7TransfersTest.test_transferBeyondBalanceReverts",
+   "P7TransfersTest.test_transferFromBeyondBalanceReverts"
+  ],
+  "invariant": [
+   "StockInvariants.invariant_P7_balancesAllowancesAndNoncesMatchTheModel"
+  ],
+  "halmos": [
+   "P7TransfersHalmos.check_transferFrom_movesAndSpendsExactly",
+   "P7TransfersHalmos.check_transfer_movesExactlyValue"
+  ],
+  "cross": [
+   "P1",
+   "P2",
+   "P4"
+  ],
+  "seconds": 72,
+  "killed": true
+ }
+]

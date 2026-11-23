@@ -1,0 +1,347 @@
+From 32990da3800176d61b9071c0cbbf8aa07d1acb2c Mon Sep 17 00:00:00 2001
+From: brainchaindev <hello@usebrainchain.com>
+Date: Mon, 23 Nov 2026 15:23:51 +0000
+Subject: [PATCH 01/11] lift: accept addmod, mulmod and mcopy with transfer
+ soundness
+
+---
+ Blanc/Lift/FreePtrMem.lean | 45 +++++++++++++++++++++--
+ Blanc/Lift/StepMemory.lean | 44 +++++++++++++++++++++--
+ Blanc/Lift/Transfer.lean   | 73 ++++++++++++++++++++++++++++++++++++--
+ scripts/lift/lift.py       |  8 +++--
+ 4 files changed, 160 insertions(+), 10 deletions(-)
+
+diff --git a/Blanc/Lift/FreePtrMem.lean b/Blanc/Lift/FreePtrMem.lean
+index 8f782b6..a8e1bec 100644
+--- a/Blanc/Lift/FreePtrMem.lean
++++ b/Blanc/Lift/FreePtrMem.lean
+@@ -11,9 +11,9 @@ Goal `usdc-neversigner-freepointer-v1`, design `fp-checker.md` §1 points 3–5.
+ * `memEff_fpWord`: the symbol `memEff` returns names the free-pointer word after the step
+   (`FpWord`): the store of a good value at constant `64` names the stored symbol; a write whose
+   window `apartW` places outside `[64, 96)` keeps `fp` (every writer: `MSTORE`, `MSTORE8`,
+-  `CALLDATACOPY`, `CODECOPY`, `RETURNDATACOPY`, and the output windows of `CALL`, `DELEGATECALL`,
+-  `STATICCALL`); every other instruction the transfer accepts leaves the word alone.  `MCOPY`,
+-  `EXTCODECOPY`, `CALLCODE` and `CREATE` are rejected by `ninstTransfer`, hence by `fstep`.
++  `CALLDATACOPY`, `CODECOPY`, `RETURNDATACOPY`, `MCOPY`, and the output windows of `CALL`,
++  `DELEGATECALL`, `STATICCALL`); every other instruction the transfer accepts leaves the word
++  alone.  `EXTCODECOPY`, `CALLCODE` and `CREATE` are rejected by `ninstTransfer`, hence by `fstep`.
+ * `memEff_touched`: the potential facts `memEff` adds hold after the step, under `Pot d'`
+   (`Pot.size_lt`): the executed window ends inside the new memory size, which is below `memCap`.
+ * `memEff_obs`, `memEff_mload_top`: the strict read sees a good pointer, and the free-pointer
+@@ -302,6 +302,25 @@ theorem memEff_fpWord_noStateGas {ν : Nat → B256} {fs : List Fact} {fp fp' :
+       split
+       · exact hw.write (miss_of_apartW hf ‹_› hl.le)
+       · exact FpWord.none _ _
++    case mcopy =>
++      rcases kv with _ | ⟨o, _ | ⟨src, _ | ⟨l, kv⟩⟩⟩
++      · cases ht
++      · cases ht
++      · cases ht
++      rcases hS with _ | ⟨rfl, _ | ⟨rfl, _ | ⟨rfl, hS⟩⟩⟩
++      obtain ⟨μ, ys, hd, hsz, hl, hm⟩ := run_mcopy_memory hstack run
++      rw [hm]
++      simp only [memEff, Option.some.injEq, Prod.mk.injEq] at he
++      obtain ⟨rfl, -⟩ := he
++      split
++      · exact (FpWord.of_data hd hsz hw).write (miss_of_apartW hf ‹_› hl.le)
++      · exact FpWord.none _ _
++    case addmod =>
++      rw [fp_keep he rfl, run_addmod_memory run]
++      exact hw
++    case mulmod =>
++      rw [fp_keep he rfl, run_mulmod_memory run]
++      exact hw
+ 
+ /-- Covered-fork projection of free-pointer memory-effect soundness. -/
+ theorem memEff_fpWord {ν : Nat → B256} {fs : List Fact} {fp fp' : Option Nat} {n : Ninst}
+@@ -499,6 +518,26 @@ theorem memEff_touched {ν : Nat → B256} {fs : List Fact} {fp fp' : Option Nat
+         rw [← hm] at hsz
+         exact touched_holds hf (by omega)
+       · exact fun _ h => nomatch h
++    case mcopy =>
++      rcases kv with _ | ⟨o, _ | ⟨src, _ | ⟨l, kv⟩⟩⟩
++      · cases ht
++      · cases ht
++      · cases ht
++      rcases hS with _ | ⟨rfl, _ | ⟨rfl, _ | ⟨rfl, hS⟩⟩⟩
++      obtain ⟨μ, ys, -, -, hl, hm⟩ := run_mcopy_memory hstack run
++      simp only [memEff, Option.some.injEq, Prod.mk.injEq] at he
++      rw [← he.2]
++      split
++      · rename_i h1
++        have hlo := lo_le hf l
++        have hne : ys ≠ [] := by
++          rintro rfl
++          simp only [List.length_nil] at hl
++          omega
++        have hsz := Mem.write_size_ge μ (ν o).toNat hne
++        rw [← hm] at hsz
++        exact touched_holds hf (by omega)
++      · exact fun _ h => nomatch h
+ 
+ 
+ /-! ## The free-pointer read -/
+diff --git a/Blanc/Lift/StepMemory.lean b/Blanc/Lift/StepMemory.lean
+index dbaadfb..5abd117 100644
+--- a/Blanc/Lift/StepMemory.lean
++++ b/Blanc/Lift/StepMemory.lean
+@@ -1,5 +1,6 @@
+ import Blanc.Lift.MemMap
+ import Blanc.Lift.CallEffects
++import Blanc.WordArithmetic
+ 
+ /-!
+ # What one instruction step does to memory (contract-neutral)
+@@ -7,13 +8,13 @@ import Blanc.Lift.CallEffects
+ The memory a successful lifted step (`Ninst.Run`) leaves, read off Jaune's step functions for the
+ instructions whose memory effect no shared lemma states yet:
+ 
+-* the writers: `MSTORE8`, `CODECOPY`, `RETURNDATACOPY` (beside `mstore_run_memory` and
++* the writers: `MSTORE8`, `CODECOPY`, `RETURNDATACOPY`, `MCOPY` (beside `mstore_run_memory` and
+   `calldatacopy_run_memory` in `Blanc/Lift/MemMap.lean`), and the output windows of `CALL`,
+   `DELEGATECALL` and `STATICCALL`: at most `outputSize` bytes at `outputIndex`, over the memory
+   extended for the input and output windows, on every arm (failed balance or depth check, child
+   error, child success);
+ * the instructions that keep memory although `rinstMemKeeps` does not list them: `EXP`, `BALANCE`,
+-  `EXTCODESIZE` (and `MLOAD`'s extension, `CREATE2`'s extension).
++  `EXTCODESIZE`, `ADDMOD`, `MULMOD` (and `MLOAD`'s extension, `CREATE2`'s extension).
+ 
+ The stack pops are computed on a known stack (`Devm.pop_cons` and its `withStack` forms), so each
+ inversion is a short `simp only` over the step and a split on its few branches.
+@@ -302,6 +303,45 @@ theorem run_returndatacopy_memory {sevm : Sevm} {d d' : Devm} {o src z : B256}
+   rw [← (Devm.burn_of_chargeGas h3).memory]
+   rfl
+ 
++/-- `MCOPY` writes `length` bytes at its destination, over the memory extended for its source
++window (and the destination's extension is part of the write). -/
++theorem run_mcopy_memory {sevm : Sevm} {d d' : Devm} {o src z : B256} {rest : List B256}
++    (hs : d.stack = o :: src :: z :: rest) (run : Ninst.Run sevm d (.reg .mcopy) d') :
++    ∃ (μ : Mem) (ys : Bytes), μ.data = d.memory.data ∧ d.memory.size ≤ μ.size ∧
++      ys.length = z.toNat ∧ d'.memory = μ.write o.toNat ys := by
++  rcases of_run_reg run with ⟨pc, h⟩
++  simp only [Rinst.run, Rinst.runCore] at h
++  split at h
++  swap
++  · cases h
++  simp only [Bind.bind, Except.bind, Devm.popToNat_cons hs, Devm.withStack_popToNat] at h
++  obtain ⟨d3, h3, h4⟩ := Except.bind_eq_ok h
++  cases h4
++  have hb := (Devm.burn_of_chargeGas h3).memory
++  have hk := MemKeep.memRead d3 src.toNat z.toNat
++  refine ⟨(d3.memRead src.toNat z.toNat).2.memory, (d3.memRead src.toNat z.toNat).1,
++    ?_, ?_, ?_, rfl⟩
++  · rw [hk.1, ← hb]
++    rfl
++  · have hsz := hk.2
++    rw [← hb] at hsz
++    exact hsz
++  · simp only [Devm.memRead, Mem.read, Array.sliceD_eq_map, List.length_map, List.length_range]
++
++theorem run_addmod_memory {sevm : Sevm} {d d' : Devm}
++    (run : Ninst.Run sevm d (.reg .addmod) d') : d'.memory = d.memory := by
++  rcases of_run_reg run with ⟨pc, h⟩
++  simp only [Rinst.run, Rinst.runCore] at h
++  obtain ⟨_, _, _, hd⟩ := Devm.diffBurn_of_applyTernary h
++  exact hd.memory.symm
++
++theorem run_mulmod_memory {sevm : Sevm} {d d' : Devm}
++    (run : Ninst.Run sevm d (.reg .mulmod) d') : d'.memory = d.memory := by
++  rcases of_run_reg run with ⟨pc, h⟩
++  simp only [Rinst.run, Rinst.runCore] at h
++  obtain ⟨_, _, _, hd⟩ := Devm.diffBurn_of_applyTernary h
++  exact hd.memory.symm
++
+ theorem run_mload_memory {sevm : Sevm} {d d' : Devm} {o : B256} {rest : List B256}
+     (hs : d.stack = o :: rest) (run : Ninst.Run sevm d (.reg .mload) d') :
+     d'.memory = d.memory.extend o.toNat 32 := by
+diff --git a/Blanc/Lift/Transfer.lean b/Blanc/Lift/Transfer.lean
+index adbc0c6..df1bd01 100644
+--- a/Blanc/Lift/Transfer.lean
++++ b/Blanc/Lift/Transfer.lean
+@@ -3,6 +3,7 @@ import Blanc.AbstractStackTransfer
+ import Blanc.Ladder
+ import Blanc.Lift.CallEffects
+ import Blanc.TransientSettlement
++import Blanc.WordArithmetic
+ 
+ /-!
+ # Instruction stack transfer for lifted bytecode
+@@ -32,9 +33,17 @@ def dropTransfer : Nat → Pattern → Option Pattern
+   | n + 1, _ :: words => dropTransfer n words
+   | _ + 1, [] => none
+ 
++/-- Pop three words and push one computed word (`ADDMOD`, `MULMOD`). -/
++def ternaryTransfer : Pattern → Option Pattern
++  | _ :: _ :: _ :: words => some (none :: words)
++  | _ => none
++
+ /-- `regularTransfer`, extended by the regular opcodes of solc output that it
+ rejects (and `XOR`, which Vyper uses for `!=`). -/
+ def liftRegularTransfer : Rinst → Pattern → Option Pattern
++  | .addmod, words => ternaryTransfer words
++  | .mulmod, words => ternaryTransfer words
++  | .mcopy, words => dropTransfer 3 words
+   | .exp, words => binaryTransfer words
+   | .slt, words => binaryTransfer words
+   | .not, words => unaryTransfer words
+@@ -143,6 +152,16 @@ private theorem binaryTransfer_map (φ : Option B256 → Option B256)
+           cases checked
+           simp only [List.map_cons, hφ]
+ 
++private theorem ternaryTransfer_map (φ : Option B256 → Option B256)
++    (hφ : φ none = none) {words output : Pattern}
++    (checked : ternaryTransfer words = some output) :
++    ternaryTransfer (words.map φ) = some (output.map φ) := by
++  match words, checked with
++  | _ :: _ :: _ :: words, checked =>
++      simp only [ternaryTransfer, Option.some.injEq] at checked ⊢
++      cases checked
++      simp only [List.map_cons, hφ]
++
+ private theorem dropOneTransfer_map (φ : Option B256 → Option B256)
+     (_hφ : φ none = none) {words output : Pattern}
+     (checked : dropOneTransfer words = some output) :
+@@ -201,6 +220,15 @@ private theorem dropOneTransfer_append {words output below : Pattern}
+       cases checked
+       rfl
+ 
++private theorem ternaryTransfer_append {words output below : Pattern}
++    (checked : ternaryTransfer words = some output) :
++    ternaryTransfer (words ++ below) = some (output ++ below) := by
++  match words, checked with
++  | _ :: _ :: _ :: words, checked =>
++      simp only [ternaryTransfer, Option.some.injEq] at checked ⊢
++      cases checked
++      rfl
++
+ private theorem dropTwoTransfer_append {words output below : Pattern}
+     (checked : dropTwoTransfer words = some output) :
+     dropTwoTransfer (words ++ below) = some (output ++ below) := by
+@@ -331,6 +359,7 @@ private theorem liftRegularTransfer_map {r : Rinst} {words output : Pattern}
+     (checked : liftRegularTransfer r words = some output) :
+     liftRegularTransfer r (words.map φ) = some (output.map φ) := by
+   cases r <;> simp only [liftRegularTransfer] at checked ⊢
++  case addmod | mulmod => exact ternaryTransfer_map φ hφ checked
+   case exp | slt | keccak256 | sdiv | signextend | sgt => exact binaryTransfer_map φ hφ checked
+   case not | balance | extcodesize | extcodehash | tload => exact unaryTransfer_map φ hφ checked
+   case address | origin | chainid | selfbalance | codesize | number | msize => cases checked; simp only [List.map_cons,
+@@ -340,7 +369,7 @@ private theorem liftRegularTransfer_map {r : Rinst} {words output : Pattern}
+       simpa only [Option.map_eq_some_iff, Option.map_some] using
+         congrArg (Option.map (List.map φ)) checked
+   case mod | or | xor | byte | shl => exact binaryTransfer_map φ hφ checked
+-  case calldatacopy | codecopy | returndatacopy =>
++  case calldatacopy | codecopy | returndatacopy | mcopy =>
+       rw [← dropTransfer_map φ hφ 3 words]
+       simpa only [Option.map_eq_some_iff, Option.map_some] using
+         congrArg (Option.map (List.map φ)) checked
+@@ -353,12 +382,13 @@ private theorem liftRegularTransfer_append {r : Rinst}
+     (checked : liftRegularTransfer r words = some output) :
+     liftRegularTransfer r (words ++ below) = some (output ++ below) := by
+   cases r <;> simp only [liftRegularTransfer] at checked ⊢
++  case addmod | mulmod => exact ternaryTransfer_append checked
+   case exp | slt | keccak256 | sdiv | signextend | sgt => exact binaryTransfer_append checked
+   case not | balance | extcodesize | extcodehash | tload => exact unaryTransfer_append checked
+   case address | origin | chainid | selfbalance | codesize | number | msize => cases checked; rfl
+   case log n => exact dropTransfer_append (n.val + 2) checked
+   case mod | or | xor | byte | shl => exact binaryTransfer_append checked
+-  case calldatacopy | codecopy | returndatacopy => exact dropTransfer_append 3 checked
++  case calldatacopy | codecopy | returndatacopy | mcopy => exact dropTransfer_append 3 checked
+   case returndatasize => cases checked; rfl
+   case mstore8 | tstore => exact dropTwoTransfer_append checked
+   all_goals exact regularTransfer_append checked
+@@ -598,6 +628,35 @@ private theorem binary_checked {input output : Pattern}
+           simp only [binaryTransfer, Option.some.injEq] at checked
+           exact ⟨word, word', tail, rfl, checked.symm⟩
+ 
++private theorem ternary_checked {input output : Pattern}
++    (checked : ternaryTransfer input = some output) :
++    ∃ a b c tail, input = a :: b :: c :: tail ∧ output = none :: tail := by
++  match input, checked with
++  | a :: b :: c :: tail, checked =>
++      simp only [ternaryTransfer, Option.some.injEq] at checked
++      exact ⟨a, b, c, tail, rfl, checked.symm⟩
++
++/-- A successful `MCOPY` pops its three operands (destination, source, length) and pushes
++nothing. -/
++theorem of_run_mcopy {sevm : Sevm} {s s' : Devm} (run : Ninst.Run sevm s (.reg .mcopy) s') :
++    ∃ x y z, Stack.Pop [x, y, z] s.stack s'.stack := by
++  rcases of_run_reg run with ⟨pc, h⟩
++  simp only [Rinst.run, Rinst.runCore] at h
++  split at h
++  swap
++  · cases h
++  rcases Except.bind_eq_ok h with ⟨⟨di, s₁⟩, h1, h⟩
++  rcases Except.bind_eq_ok h with ⟨⟨si, s₂⟩, h2, h⟩
++  rcases Except.bind_eq_ok h with ⟨⟨sz, s₃⟩, h3, h⟩
++  rcases Except.bind_eq_ok h with ⟨s₄, h4, h5⟩
++  rcases Devm.pop_of_popToNat_val h1 with ⟨x, p1, rfl⟩
++  rcases Devm.pop_of_popToNat_val h2 with ⟨y, p2, rfl⟩
++  rcases Devm.pop_of_popToNat_val h3 with ⟨z, p3, rfl⟩
++  cases h5
++  refine ⟨x, y, z, ?_⟩
++  rw [Devm.memWrite_stack, Devm.memRead_stack, ← (Devm.burn_of_chargeGas h4).stack]
++  exact (Devm.pop_append p1 (Devm.pop_append p2 p3)).stack
++
+ private theorem dropOne_checked {input output : Pattern}
+     (checked : dropOneTransfer input = some output) :
+     ∃ head tail, input = head :: tail ∧ output = tail := by
+@@ -1026,6 +1085,16 @@ theorem ninstTransfer_run_lane {sevm : Sevm} {devm devm' : Devm} {n : Ninst}
+           simp only [Rinst.run, Rinst.runCore] at hr
+           rcases Devm.diffBurn_of_applyBinary hr with ⟨x, y, hd⟩
+           exact matches_diff matched hd.stack
++      | addmod | mulmod =>
++          rcases ternary_checked checked with ⟨a, b, c, tail, rfl, rfl⟩
++          rcases of_run_reg run with ⟨pc, hr⟩
++          simp only [Rinst.run, Rinst.runCore] at hr
++          rcases Devm.diffBurn_of_applyTernary hr with ⟨x, y, z, hd⟩
++          exact matches_diff matched hd.stack
++      | mcopy =>
++          rcases of_run_mcopy run with ⟨x, y, z, hp⟩
++          rw [← dropTransfer_eq_drop checked]
++          exact matches_pop matched hp
+       | iszero | not =>
+           simp only [regularTransfer] at checked
+           rcases unary_checked checked with ⟨head, tail, rfl, rfl⟩
+diff --git a/scripts/lift/lift.py b/scripts/lift/lift.py
+index 09d8e02..9705378 100644
+--- a/scripts/lift/lift.py
++++ b/scripts/lift/lift.py
+@@ -169,6 +169,7 @@ OPCODE_EFFECTS: Dict[int, Tuple[str, int, int]] = {
+     0x5b: ("JUMPDEST", 0, 0),
+     0x5c: ("TLOAD", 1, 1),
+     0x5d: ("TSTORE", 2, 0),
++    0x5e: ("MCOPY", 3, 0),
+     0x5f: ("PUSH0", 0, 1),
+     0xf0: ("CREATE", 3, 1),
+     0xf1: ("CALL", 7, 1),
+@@ -195,7 +196,8 @@ for _i in range(0, 5):
+ # shape (checked by `check_lean_transfers`).
+ LEAN_REG: Dict[int, str] = {
+     0x01: ".reg .add", 0x02: ".reg .mul", 0x03: ".reg .sub", 0x04: ".reg .div",
+-    0x05: ".reg .sdiv", 0x06: ".reg .mod", 0x0a: ".reg .exp", 0x0b: ".reg .signextend",
++    0x05: ".reg .sdiv", 0x06: ".reg .mod", 0x08: ".reg .addmod", 0x09: ".reg .mulmod",
++    0x0a: ".reg .exp", 0x0b: ".reg .signextend",
+     0x10: ".reg .lt", 0x11: ".reg .gt", 0x12: ".reg .slt", 0x13: ".reg .sgt",
+     0x14: ".reg .eq", 0x15: ".reg .iszero", 0x16: ".reg .and", 0x17: ".reg .or",
+     0x18: ".reg .xor", 0x19: ".reg .not", 0x1a: ".reg .byte", 0x1b: ".reg .shl",
+@@ -208,7 +210,7 @@ LEAN_REG: Dict[int, str] = {
+     0x46: ".reg .chainid", 0x47: ".reg .selfbalance", 0x50: ".reg .pop",
+     0x51: ".reg .mload", 0x52: ".reg .mstore", 0x53: ".reg .mstore8",
+     0x54: ".reg .sload", 0x55: ".reg .sstore", 0x59: ".reg .msize", 0x5a: ".reg .gas",
+-    0x5c: ".reg .tload", 0x5d: ".reg .tstore",
++    0x5c: ".reg .tload", 0x5d: ".reg .tstore", 0x5e: ".reg .mcopy",
+     0xa0: ".reg (.log 0)", 0xa1: ".reg (.log 1)", 0xa2: ".reg (.log 2)",
+     0xa3: ".reg (.log 3)", 0xa4: ".reg (.log 4)",
+     0xf1: ".exec .call", 0xfa: ".exec .staticcall", 0xf5: ".exec .create2",
+@@ -253,7 +255,7 @@ def _arm_shape(rhs: str, source: str) -> Optional[Tuple[int, int]]:
+     m = re.fullmatch(r"dropTransfer (\d+) words", rhs)
+     if m:
+         return (int(m.group(1)), 0)
+-    m = re.fullmatch(r"(callTransfer|staticcallTransfer|create2Transfer|delegatecallTransfer) words", rhs)
++    m = re.fullmatch(r"(ternaryTransfer|callTransfer|staticcallTransfer|create2Transfer|delegatecallTransfer) words", rhs)
+     if m:
+         dm = re.search(rf"def {m.group(1)} : Pattern → Option Pattern\n\s*\| ((?:_ :: )+)words => some \(none :: words\)", source)
+         if dm:
+-- 
+2.50.1 (Apple Git-155)
+

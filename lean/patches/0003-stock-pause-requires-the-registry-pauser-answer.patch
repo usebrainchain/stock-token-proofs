@@ -1,0 +1,887 @@
+From d46f6acff7462fca69c3fceb62621eeec74b0192 Mon Sep 17 00:00:00 2001
+From: brainchaindev <hello@usebrainchain.com>
+Date: Mon, 23 Nov 2026 16:09:46 +0000
+Subject: [PATCH 03/11] stock: pause requires the registry pauser answer
+
+---
+ Blanc/Lift/Stock/Pause.lean | 868 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 868 insertions(+)
+ create mode 100644 Blanc/Lift/Stock/Pause.lean
+
+diff --git a/Blanc/Lift/Stock/Pause.lean b/Blanc/Lift/Stock/Pause.lean
+new file mode 100644
+index 0000000..73fae94
+--- /dev/null
++++ b/Blanc/Lift/Stock/Pause.lean
+@@ -0,0 +1,868 @@
++import Blanc.Lift.Stock.Jumps
++import Blanc.Lift.SolcSignedQuery
++import Blanc.Lift.StaticCall
++import Blanc.Lift.CursorSourceRun
++import Blanc.Lift.VyperCheckedArith
++
++/-!
++# Stock: `pause()` succeeds only on the registry's pauser answer
++
++Plain statement (`pause_requires_role`): for every state, environment, caller and registry code,
++if a run of Stock's deployed bytes with selector `pause()` (`0x8456cb59`) succeeds, then the run
++made a successful `STATICCALL` to the access registry `0xe10b…1b00` with calldata
++`hasRole(TOKEN_PAUSER_ROLE, caller)` over the frame's own starting world, and the registry returned
++at least 32 bytes whose first word is `1`.  Nothing is assumed about the registry's code.
++
++Premises: the frame starts at pc 0 of the registered runtime (`code`, sha256 `0ac99e9c…`) with an
++empty stack and memory, on one of Blanc's covered forks (Prague, Osaka, BPO1, BPO2).  Robinhood
++Chain is an Arbitrum Nitro chain; reading this theorem as a statement about it carries the premise
++that Nitro executes these instructions as Ethereum does.
++
++The walk: the cursor follows the checked certificate from entry 0 through the dispatcher to
++`pause()` (entry 162), its `onlyRole` modifier (entry 54), `_checkRole(role)` (entry 88) and
++`_checkRole(role, account)` (entry 119), all frame-free.  From entry 119 the certificate's source
++run is inverted across the `STATICCALL`, the ABI `bool` decoder (entries 83 and 18) and the
++`if (!hasRole) revert` branch; every rejecting branch ends in `REVERT`, which has no run.
++-/
++
++namespace Blanc.Lift.Stock
++
++open Jaune Blanc Blanc.Lift
++
++/-- The access registry named by Stock's immutables. -/
++def registry : Adr := 0xe10b6f6b275de231345c20d14ab812db62151b00
++
++/-- `keccak256("TOKEN_PAUSER_ROLE")`, the role `pause()` asks for. -/
++def tokenPauserRole : B256 :=
++  0xe95e22ec6dbf4c911d1fae59680a3e9cb71dd35b3a1c697d232e4b01a8ff30a2
++
++/-- ABI calldata of `hasRole(bytes32 role, address account)` (selector `0x91d14854`). -/
++def hasRoleData (role : B256) (account : Adr) : Bytes :=
++  [0x91, 0xd1, 0x48, 0x54] ++ role.toBytes ++ account.toB256.toBytes
++
++/-- The `pause()` selector. -/
++def pauseSelector : B256 := 0x8456cb59
++
++/-- Memory after the Solidity prologue: the free-memory pointer `0x80` at `0x40`. -/
++abbrev freeMem : Mem := Mem.empty.write 64 (128 : B256).toBytes
++
++/-! ## Inverting straight lines of a source run -/
++
++section Lines
++
++variable {P : Sevm → Devm → Ninst → Devm → Prop} {fs : List SFunc} {sevm : Sevm}
++
++private theorem rpw_nexts (project : ∀ {s d i d'}, P s d i d' → Ninst.Run s d i d')
++    (ns : List Ninst) {pre : Devm} {tail : SFunc} {o : Outcome}
++    (run : SFunc.RunP P fs sevm pre (ns.foldr SFunc.next tail) o) :
++    ∃ post, Line.Run sevm pre ns post ∧ SFunc.RunP P fs sevm post tail o := by
++  induction ns generalizing pre with
++  | nil => exact ⟨pre, .nil, run⟩
++  | cons n ns ih =>
++    change SFunc.RunP P fs sevm pre (.next n (ns.foldr SFunc.next tail)) o at run
++    obtain ⟨middle, first, rest⟩ := rpw_next run
++    obtain ⟨post, line, tailRun⟩ := ih rest
++    exact ⟨post, .cons (project first) line, tailRun⟩
++
++/-- A line ending in a jump to a tree that cannot succeed has no run. -/
++private theorem rpw_nexts_jump_dead (ns : List Ninst) {k : Nat} {g : SFunc}
++    (lookup : fs[k]? = some g) (dead : g.noOk = true) {pre : Devm} {o : Outcome}
++    (run : SFunc.RunP P fs sevm pre (ns.foldr SFunc.next (.jump k)) o) : False := by
++  induction ns generalizing pre with
++  | nil =>
++    cases run with
++    | jump _ entry _ rest =>
++      rw [lookup] at entry
++      cases entry
++      exact (SFunc.runP_iff_runCutP_nil.mp rest).false_of_noOk dead
++  | cons n ns ih =>
++    change SFunc.RunP P fs sevm pre (.next n (ns.foldr SFunc.next (.jump k))) o at run
++    obtain ⟨_, _, rest⟩ := rpw_next run
++    exact ih rest
++
++private theorem rpw_dead {f : SFunc} (dead : f.noOk = true) {pre : Devm} {o : Outcome}
++    (run : SFunc.RunP P fs sevm pre f o) : False :=
++  (SFunc.runP_iff_runCutP_nil.mp run).false_of_noOk dead
++
++end Lines
++
++/-- Trees whose every path either fails or jumps into an entry that cannot succeed. -/
++private def jumpsDead (fs : List SFunc) : SFunc → Bool
++  | .next _ f => jumpsDead fs f
++  | .dest f => jumpsDead fs f
++  | .jump k => (fs[k]?.map SFunc.noOk).getD true
++  | f => f.noOk
++
++section Dead
++
++variable {P : Sevm → Devm → Ninst → Devm → Prop} {fs : List SFunc} {sevm : Sevm}
++
++private theorem rpw_jumpsDead {f : SFunc} {pre : Devm} {o : Outcome}
++    (run : SFunc.RunP P fs sevm pre f o) (h : jumpsDead fs f = true) : False := by
++  induction run with
++  | next _ _ ih => exact ih h
++  | dest _ _ ih => exact ih h
++  | jump d entry pop rest _ =>
++    simp only [jumpsDead, entry, Option.map_some, Option.getD_some] at h
++    exact rpw_dead h rest
++  | zero d pop rest _ => exact rpw_dead h (.zero d pop rest)
++  | succ d w nz pop rest _ => exact rpw_dead h (.succ d w nz pop rest)
++  | toZero d pop rest _ => exact rpw_dead h (.toZero d pop rest)
++  | toSucc d w nz entry pop rest _ => exact rpw_dead h (.toSucc d w nz entry pop rest)
++  | last hl => exact rpw_dead (P := P) (fs := fs) h (.last hl)
++  | ret _ _ => simp only [jumpsDead, SFunc.noOk, Bool.false_eq_true] at h
++  | callHalt d entry pop callee _ => exact rpw_dead h (.callHalt d entry pop callee)
++  | callRet d entry pop callee rest _ _ => exact rpw_dead h (.callRet d entry pop callee rest)
++  | pcAt _ _ _ _ => simp only [jumpsDead, SFunc.noOk, Bool.false_eq_true] at h
++
++end Dead
++
++/-! ## The `hasRole` query of `_checkRole(role, account)` (entry 119) -/
++
++/-- Entry 119 up to the `STATICCALL`: lay out `hasRole(role, account)` at the free pointer and push
++the call's operands. -/
++private def queryLine : List Ninst :=
++  [.push [0x40] (by decide), .reg .mload, .push [0x24, 0x74, 0x52, 0x15] (by decide),
++   .push [0xe2] (by decide), .reg .shl, .reg (.dup 1), .reg .mstore, .push [0x04] (by decide),
++   .reg (.dup 1), .reg .add, .reg (.dup 3), .reg (.swap 0), .reg .mstore,
++   .push [0x01] (by decide), .push [0x01] (by decide), .push [0xa0] (by decide), .reg .shl,
++   .reg .sub, .reg (.dup 2), .reg (.dup 1), .reg .and, .push [0x24] (by decide), .reg (.dup 3),
++   .reg .add, .reg .mstore,
++   .push [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe1, 0x0b,
++     0x6f, 0x6b, 0x27, 0x5d, 0xe2, 0x31, 0x34, 0x5c, 0x20, 0xd1, 0x4a, 0xb8, 0x12, 0xdb, 0x62,
++     0x15, 0x1b, 0x00] (by decide),
++   .reg .and, .reg (.swap 0), .push [0x91, 0xd1, 0x48, 0x54] (by decide), .reg (.swap 0),
++   .push [0x44] (by decide), .reg .add, .push [0x20] (by decide), .push [0x40] (by decide),
++   .reg .mload, .reg (.dup 0), .reg (.dup 3), .reg .sub, .reg (.dup 1), .reg (.dup 6), .reg .gas]
++
++/-- The call-flag guard after the `STATICCALL`. -/
++private def flagLine : List Ninst :=
++  [.reg .iszero, .reg (.dup 0), .reg .iszero, .push [0x1e, 0xcb] (by decide)]
++
++/-- The success side: drop the call operands, move the free pointer past the return data, and
++call the ABI `bool` decoder on `[ptr, ptr + returndatasize)`. -/
++private def replyLine : List Ninst :=
++  [.reg .pop, .reg .pop, .reg .pop, .reg .pop, .push [0x40] (by decide), .reg .mload,
++   .reg .returndatasize, .push [0x1f] (by decide), .reg .not, .push [0x1f] (by decide),
++   .reg (.dup 2), .reg .add, .reg .and, .reg (.dup 2), .reg .add, .reg (.dup 0),
++   .push [0x40] (by decide), .reg .mstore, .reg .pop, .reg (.dup 1), .reg .add, .reg (.swap 0),
++   .push [0x1e, 0xef] (by decide), .reg (.swap 1), .reg (.swap 0), .push [0x29, 0xf1] (by decide)]
++
++/-- The decoder's length check (entry 83). -/
++private def lengthLine : List Ninst :=
++  [.push [] (by decide), .push [0x20] (by decide), .reg (.dup 2), .reg (.dup 4), .reg .sub,
++   .reg .slt, .reg .iszero, .push [0x2a, 0x01] (by decide)]
++
++/-- The decoder's `bool` check: the word must equal its own double negation. -/
++private def boolLine : List Ninst :=
++  [.reg (.dup 1), .reg .mload, .reg (.dup 0), .reg .iszero, .reg .iszero, .reg (.dup 1), .reg .eq,
++   .push [0x1a, 0x1b] (by decide)]
++
++/-- The decoder's return shuffle (entry 18). -/
++private def unwindLine : List Ninst :=
++  [.reg (.swap 3), .reg (.swap 2), .reg .pop, .reg .pop, .reg .pop]
++
++private theorem entry119_shape : t_1e60_c119 = .dest (queryLine.foldr SFunc.next
++    (.next (.exec .staticcall) (flagLine.foldr SFunc.next (.branch t_1ec4_c119 t_1ecb_c119)))) :=
++  rfl
++
++private theorem reply_shape : t_1ecb_c119 = .dest (replyLine.foldr SFunc.next
++    (.callNext 83 t_1eef_c119)) := rfl
++
++private theorem length_shape : t_29f1_c83 = .dest (lengthLine.foldr SFunc.next
++    (.branch t_29fe_c83 t_2a01_c83)) := rfl
++
++private theorem bool_shape : t_2a01_c83 = .dest (boolLine.foldr SFunc.next
++    (.branchTo t_2a0d_c83 18)) := rfl
++
++private theorem unwind_shape : t_1a1b_c18 = .dest (unwindLine.foldr SFunc.next .ret) := rfl
++
++private theorem verdict_shape : t_1eef_c119 = .dest (.next (.push [0x0e, 0xd0] (by decide))
++    (.branchTo t_1ef4_c119 9)) := rfl
++
++section Query
++
++variable {sevm : Sevm}
++
++/-- `SLT`, inverted with its value. -/
++private theorem ri_slt_val {b : Devm} {S : List B256} {M : Mem} {G : Nat} {x y : B256} {d : Devm}
++    (h : Ninst.Run sevm (St b (x :: y :: S) M G) (.reg .slt) d) :
++    ∃ G', d = St b (B256.sltCheck x y :: S) M G' := by
++  rcases of_run_reg h with ⟨pc, run⟩
++  simp only [Rinst.run, Rinst.runCore] at run
++  exact St.of_diff (v := B256.sltCheck) (Devm.diffBurn_of_applyBinary run)
++
++private theorem mask_eq :
++    (Bytes.toB256 [0x01] <<< (Bytes.toB256 [0xa0]).toNat) - Bytes.toB256 [0x01] =
++      ~~~ addressMask := by decide
++
++private theorem registry_word :
++    (Bytes.toB256 [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe1,
++      0x0b, 0x6f, 0x6b, 0x27, 0x5d, 0xe2, 0x31, 0x34, 0x5c, 0x20, 0xd1, 0x4a, 0xb8, 0x12, 0xdb,
++      0x62, 0x15, 0x1b, 0x00] &&& ~~~ addressMask).toAdr = registry := by decide
++
++private theorem selector_word :
++    ((Bytes.toB256 [0x24, 0x74, 0x52, 0x15] <<< (Bytes.toB256 [0xe2]).toNat).toBytes).sliceD 0 4 0 =
++      [0x91, 0xd1, 0x48, 0x54] := by decide
++
++/-- The memory `queryLine` leaves before its final `MLOAD`: `hasRole`'s selector word at the free
++pointer, the role at `+4`, the masked account at `+0x24`. -/
++private def queryMem (M : Mem) (A R : B256) : Mem :=
++  (((M.read (Bytes.toB256 [0x40]).toNat 32).2.write (128 : B256).toNat
++    (Bytes.toB256 [0x24, 0x74, 0x52, 0x15] <<< (Bytes.toB256 [0xe2]).toNat).toBytes).write
++    ((128 : B256) + Bytes.toB256 [0x04]).toNat R.toBytes).write
++    ((128 : B256) + Bytes.toB256 [0x24]).toNat
++    (((Bytes.toB256 [0x01] <<< (Bytes.toB256 [0xa0]).toNat) - Bytes.toB256 [0x01]) &&& A).toBytes
++
++private theorem query_memory {M : Mem} {I : Bytes} {A R : B256}
++    (reads : Mem.Reads M I) (wf : Mem.Wf M) (ptr : I.sliceD 64 32 0 = (128 : B256).toBytes) :
++    ∃ I3 : Bytes, Mem.Reads (queryMem M A R) I3 ∧ Mem.Wf (queryMem M A R) ∧
++      I3.sliceD 64 32 0 = (128 : B256).toBytes ∧
++      I3.sliceD 128 68 0 = [0x91, 0xd1, 0x48, 0x54] ++ R.toBytes ++ A.toAdr.toB256.toBytes := by
++  have w0 : Mem.Wf (M.read (Bytes.toB256 [0x40]).toNat 32).2 := Mem.Wf.extend wf _ _
++  have r0 : Mem.Reads (M.read (Bytes.toB256 [0x40]).toNat 32).2 I := reads.extend _ _
++  have w1 := Mem.Wf.write w0 (128 : B256).toNat
++    (Bytes.toB256 [0x24, 0x74, 0x52, 0x15] <<< (Bytes.toB256 [0xe2]).toNat).toBytes
++  have r1 := r0.write w0 (128 : B256).toNat
++    (Bytes.toB256 [0x24, 0x74, 0x52, 0x15] <<< (Bytes.toB256 [0xe2]).toNat).toBytes
++  have w2 := Mem.Wf.write w1 ((128 : B256) + Bytes.toB256 [0x04]).toNat R.toBytes
++  have r2 := r1.write w1 ((128 : B256) + Bytes.toB256 [0x04]).toNat R.toBytes
++  have w3 := Mem.Wf.write w2 ((128 : B256) + Bytes.toB256 [0x24]).toNat
++    (((Bytes.toB256 [0x01] <<< (Bytes.toB256 [0xa0]).toNat) - Bytes.toB256 [0x01]) &&& A).toBytes
++  have r3 := r2.write w2 ((128 : B256) + Bytes.toB256 [0x24]).toNat
++    (((Bytes.toB256 [0x01] <<< (Bytes.toB256 [0xa0]).toNat) - Bytes.toB256 [0x01]) &&& A).toBytes
++  have n0 : (128 : B256).toNat = 128 := by decide
++  have n4 : ((128 : B256) + Bytes.toB256 [0x04]).toNat = 132 := by decide
++  have n24 : ((128 : B256) + Bytes.toB256 [0x24]).toNat = 164 := by decide
++  refine ⟨_, r3, w3, ?_, ?_⟩
++  · rw [n0, n4, n24, Bytes.sliceD_writeAt_before _ _ _ _ _ (by omega),
++      Bytes.sliceD_writeAt_before _ _ _ _ _ (by omega),
++      Bytes.sliceD_writeAt_before _ _ _ _ _ (by omega), ptr]
++  · rw [n0, n4, n24, show (68 : Nat) = 4 + (32 + 32) from rfl, List.sliceD_split,
++      List.sliceD_split, show (128 + 4 : Nat) = 132 from rfl,
++      show (132 + 32 : Nat) = 164 from rfl]
++    have back2 := Bytes.sliceD_writeAt
++      (Bytes.writeAt I 128 (Bytes.toB256 [0x24, 0x74, 0x52, 0x15] <<<
++        (Bytes.toB256 [0xe2]).toNat).toBytes) R.toBytes 132
++    have back3 := Bytes.sliceD_writeAt
++      (Bytes.writeAt (Bytes.writeAt I 128 (Bytes.toB256 [0x24, 0x74, 0x52, 0x15] <<<
++        (Bytes.toB256 [0xe2]).toNat).toBytes) 132 R.toBytes) (((Bytes.toB256 [0x01] <<<
++        (Bytes.toB256 [0xa0]).toNat) - Bytes.toB256 [0x01]) &&& A).toBytes 164
++    rw [B256.length_toBytes] at back2 back3
++    rw [Bytes.sliceD_writeAt_before _ _ 128 4 164 (by omega),
++      Bytes.sliceD_writeAt_before _ _ 128 4 132 (by omega),
++      Bytes.sliceD_writeAt_inside _ _ 128 128 4 (by omega) (by rw [B256.length_toBytes]; omega),
++      Nat.sub_self, selector_word,
++      Bytes.sliceD_writeAt_before _ _ 132 32 164 (by omega), back2, back3,
++      mask_eq, B256.and_comm, and_mask_word, List.append_assoc]
++
++theorem query_line {b d : Devm} {A R : B256} {S : List B256} {M : Mem} {G : Nat} {I : Bytes}
++    (reads : Mem.Reads M I) (wf : Mem.Wf M) (ptr : I.sliceD 64 32 0 = (128 : B256).toBytes)
++    (run : Line.Run sevm (St b (A :: R :: S) M G) queryLine d) :
++    ∃ (gw t ii is os e s : B256) (M' : Mem) (I' : Bytes) (G' : Nat),
++      d = St b (gw :: t :: ii :: is :: ii :: os :: e :: s :: t :: A :: R :: S) M' G' ∧
++      t.toAdr = registry ∧ ii = 128 ∧ is = 68 ∧ os = 32 ∧
++      Mem.Reads M' I' ∧ Mem.Wf M' ∧ I'.sliceD 64 32 0 = (128 : B256).toBytes ∧
++      I'.sliceD 128 68 0 = [0x91, 0xd1, 0x48, 0x54] ++ R.toBytes ++ A.toAdr.toB256.toBytes := by
++  have n40 : (Bytes.toB256 [0x40]).toNat = 64 := by decide
++  have r64 : (M.read (Bytes.toB256 [0x40]).toNat 32).1 = (128 : B256).toBytes := by
++    rw [reads.read, n40]
++    exact ptr
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mload step
++  rw [r64, B256.toB256_toBytes] at run
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_shl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mstore step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_add step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mstore step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_shl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_sub step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_and step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_add step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mstore step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_and step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_add step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mload step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_sub step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨gw, _, rfl⟩ := ri_gas step
++  cases run
++  obtain ⟨I3, r3, w3, p3, d3⟩ := query_memory (A := A) (R := R) reads wf ptr
++  have fp : Bytes.toB256 ((queryMem M A R).read (Bytes.toB256 [0x40]).toNat 32).1 = 128 := by
++    rw [r3.read, n40, p3, B256.toB256_toBytes]
++  refine ⟨gw, _, _, _, _, _, _, _, I3, _, rfl, ?_, fp, ?_, by decide, r3.extend _ _,
++    Mem.Wf.extend w3 _ _, p3, d3⟩
++  · rw [mask_eq]
++    exact registry_word
++  · exact (congrArg (fun z => (Bytes.toB256 [0x44] + (128 : B256)) - z) fp).trans (by decide)
++
++private theorem flag_line {b d : Devm} {flag : B256} {S : List B256} {M : Mem} {G : Nat}
++    (run : Line.Run sevm (St b (flag :: S) M G) flagLine d) :
++    ∃ G', d = St b (Bytes.toB256 [0x1e, 0xcb] :: B256.eqCheck (B256.eqCheck flag 0) 0 ::
++      B256.eqCheck flag 0 :: S) M G' := by
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_iszero step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_iszero step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  cases run
++  exact ⟨_, rfl⟩
++
++private theorem reply_line {b d : Devm} {e x1 x2 x3 A R : B256} {S : List B256} {M : Mem}
++    {G : Nat} {I : Bytes}
++    (reads : Mem.Reads M I) (wf : Mem.Wf M) (ptr : I.sliceD 64 32 0 = (128 : B256).toBytes)
++    (run : Line.Run sevm (St b (e :: x1 :: x2 :: x3 :: A :: R :: S) M G) replyLine d) :
++    ∃ (M' : Mem) (I' : Bytes) (G' : Nat),
++      d = St b (Bytes.toB256 [0x29, 0xf1] :: 128 :: (128 + b.returnData.length.toB256) ::
++        Bytes.toB256 [0x1e, 0xef] :: A :: R :: S) M' G' ∧
++      Mem.Reads M' I' ∧ Mem.Wf M' ∧ I'.sliceD 128 32 0 = I.sliceD 128 32 0 := by
++  have n40 : (Bytes.toB256 [0x40]).toNat = 64 := by decide
++  have r64 : (M.read (Bytes.toB256 [0x40]).toNat 32).1 = (128 : B256).toBytes := by
++    rw [reads.read, n40]
++    exact ptr
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mload step
++  rw [r64, B256.toB256_toBytes] at run
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_returndatasize step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_not step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_add step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_and step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_add step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mstore step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_add step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  cases run
++  have w1 : Mem.Wf (M.read (Bytes.toB256 [0x40]).toNat 32).2 := Mem.Wf.extend wf _ _
++  have r1 : Mem.Reads (M.read (Bytes.toB256 [0x40]).toNat 32).2 I := reads.extend _ _
++  refine ⟨_, _, _, rfl, r1.write w1 _ _, Mem.Wf.write w1 _ _, ?_⟩
++  rw [Bytes.sliceD_writeAt_after _ _ _ _ _ (by rw [B256.length_toBytes, n40]; omega)]
++
++private theorem length_line {b d : Devm} {p q ret : B256} {S : List B256} {M : Mem} {G : Nat}
++    (run : Line.Run sevm (St b (p :: q :: ret :: S) M G) lengthLine d) :
++    ∃ G', d = St b (Bytes.toB256 [0x2a, 0x01] ::
++      B256.eqCheck (B256.sltCheck (q - p) (Bytes.toB256 [0x20])) 0 :: Bytes.toB256 [] ::
++      p :: q :: ret :: S) M G' := by
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_sub step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_slt_val step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_iszero step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  cases run
++  exact ⟨_, rfl⟩
++
++private theorem bool_line {b d : Devm} {z p q ret : B256} {S : List B256} {M : Mem} {G : Nat}
++    (run : Line.Run sevm (St b (z :: p :: q :: ret :: S) M G) boolLine d) :
++    ∃ G', d = St b (Bytes.toB256 [0x1a, 0x1b] ::
++      B256.eqCheck (Bytes.toB256 (M.read p.toNat 32).1)
++        (B256.eqCheck (B256.eqCheck (Bytes.toB256 (M.read p.toNat 32).1) 0) 0) ::
++      Bytes.toB256 (M.read p.toNat 32).1 :: z :: p :: q :: ret :: S) (M.read p.toNat 32).2 G' := by
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_mload step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_iszero step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_iszero step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_dup rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_eq step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  cases run
++  exact ⟨_, rfl⟩
++
++private theorem unwind_line {b d : Devm} {v z p q ret : B256} {S : List B256} {M : Mem} {G : Nat}
++    (run : Line.Run sevm (St b (v :: z :: p :: q :: ret :: S) M G) unwindLine d) :
++    ∃ G', d = St b (ret :: v :: S) M G' := by
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_swap rfl step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_pop step
++  cases run
++  exact ⟨_, rfl⟩
++
++end Query
++
++/-! ## Word facts the decoder establishes -/
++
++/-- A word that is not below `32` as a signed number is at least `32`. -/
++private theorem le_toNat_of_not_slt {x : B256} (h : ¬ B256.Slt x (Bytes.toB256 [0x20])) :
++    32 ≤ x.toNat := by
++  have em : (B256.max >>> 1 : B256) = B256.low255 := rfl
++  unfold B256.Slt at h
++  rw [em] at h
++  cases ha : x.highBit
++  · have hand : x &&& B256.low255 = x := by
++      obtain ⟨⟨a, b⟩, ⟨c, d⟩⟩ := x
++      show ((a &&& 0x7fffffffffffffff, b &&& UInt64.max), (c &&& UInt64.max, d &&& UInt64.max)) = _
++      rw [UInt64.and_low63 a ha, UInt64.and_max_self, UInt64.and_max_self, UInt64.and_max_self]
++      rfl
++    have h32m : Bytes.toB256 [0x20] &&& B256.low255 = Bytes.toB256 [0x20] := rfl
++    have h32h : (Bytes.toB256 [0x20]).highBit = false := rfl
++    rw [hand, h32m, ha, h32h] at h
++    have nlt : ¬ x < Bytes.toB256 [0x20] := fun lt => h (Or.inr ⟨rfl, lt⟩)
++    rw [B256.lt_iff_toNat_lt_toNat, show (Bytes.toB256 [0x20]).toNat = 32 by decide] at nlt
++    omega
++  · exfalso
++    apply h
++    left
++    rw [ha]
++    decide
++
++private theorem add_sub_cancel_left' (a x : B256) : (a + x) - a = x := by
++  apply B256.toNat_inj
++  have ha := B256.toNat_lt a
++  have hx := B256.toNat_lt x
++  rw [B256.toNat_sub, B256.toNat_add, Nat.lo_eq, Nat.lo_eq]
++  generalize a.toNat = m at *
++  generalize x.toNat = n at *
++  simp only [Nat.reducePow] at *
++  omega
++
++/-- The decoder accepts a word only if it is `0` or `1`; the branch after it needs it nonzero. -/
++private theorem eq_one_of_bool {v : B256} (nz : v ≠ 0)
++    (ok : B256.eqCheck v (B256.eqCheck (B256.eqCheck v 0) 0) ≠ 0) : v = 1 := by
++  have e0 : B256.eqCheck v 0 = 0 := B256.eqCheck_eq_zero_iff.mpr nz
++  rw [e0, show B256.eqCheck (0 : B256) 0 = 1 by decide] at ok
++  exact B256.eqCheck_ne_zero_iff.mp ok
++
++
++/-! ## From pc 0 to `_checkRole(role, account)` -/
++
++/-- The selector prefix, with solc 0.8's `PUSH0` for the calldata offset. -/
++private def selectorLine0 : List Ninst :=
++  [.push [] (by decide), .reg .calldataload, .push [0xe0] (by decide), .reg .shr]
++
++private theorem selector_line0 {sevm : Sevm} {b d : Devm} {S : List B256} {M : Mem} {G : Nat}
++    (run : Line.Run sevm (St b S M G) selectorLine0 d) :
++    ∃ G', d = St b (Sevm.selector sevm :: S) M G' := by
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_calldataload step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_push step
++  obtain ⟨_, step, run⟩ := Line.of_run_cons run
++  obtain ⟨_, rfl⟩ := ri_shr step
++  cases run
++  exact ⟨_, rfl⟩
++
++private theorem root_selected {F : Exec.Deriv} {post : Devm}
++    (pc : F.pc = 0) (onCode : F.sevm.code = code)
++    (stack : F.devm.stack = []) (memory : F.devm.memory = Mem.empty)
++    (success : F.exn = .ok post) (fork : NeutralFork F.sevm.benvStat.fork) :
++    Nonempty (CursorStateAt code cert F
++      ((SolcSignedQuery.compareLine .gt 0x77 0x06 0xba 0x52 0x01 0x1f).foldr SFunc.next
++        (.branch t_0029_c0 t_011f_c0)) F.devm [Sevm.selector F.sevm] freeMem []) := by
++  have first : CursorStateAt code cert F t_0000_c0 F.devm [] Mem.empty [] :=
++    ⟨F, Cursor.start cert, .refl _, rfl, rfl, cursor_start cert_check pc onCode, rfl,
++      ⟨_, St.self stack memory⟩, rfl⟩
++  obtain ⟨guard⟩ := first.lineH cert_check success fork.stateGas
++    (SolcSignedQuery.prologue 0 0x0f) rfl
++    (by intro ni member xi same; subst ni
++        simp only [SolcSignedQuery.prologue, List.mem_cons, List.not_mem_nil, reduceCtorEq,
++          or_self] at member)
++    SolcSignedQuery.prologue_line
++  obtain ⟨_, ⟨entered⟩⟩ := SolcSignedQuery.guardSucc guard cert_check rfl success fork
++  obtain ⟨opened⟩ := entered.destH cert_check success fork.stateGas
++  obtain ⟨sized⟩ := opened.lineH cert_check success fork.stateGas
++    (SolcSignedQuery.sizeLine 0x02 0x13) rfl
++    (by intro ni member xi same; subst ni
++        simp only [SolcSignedQuery.sizeLine, List.mem_cons, List.not_mem_nil, reduceCtorEq,
++          or_self] at member)
++    SolcSignedQuery.size_line
++  obtain ⟨_, ⟨selecting⟩⟩ := SolcSignedQuery.guardZero sized cert_check rfl success fork
++  exact selecting.lineH cert_check success fork.stateGas selectorLine0 rfl
++    (by intro ni member xi same; subst ni
++        simp only [selectorLine0, List.mem_cons, List.not_mem_nil, reduceCtorEq, or_self] at member)
++    selector_line0
++
++private theorem root_pause {F : Exec.Deriv} {post : Devm}
++    (pc : F.pc = 0) (onCode : F.sevm.code = code)
++    (stack : F.devm.stack = []) (memory : F.devm.memory = Mem.empty)
++    (selector : Sevm.selector F.sevm = pauseSelector)
++    (success : F.exn = .ok post) (fork : NeutralFork F.sevm.benvStat.fork) :
++    Nonempty (CursorStateAt code cert F t_03ca_c162 F.devm [pauseSelector] freeMem []) := by
++  obtain ⟨selected⟩ := root_selected pc onCode stack memory success fork
++  rw [selector] at selected
++  obtain ⟨c0⟩ := SolcSignedQuery.selector_gt_zero selected cert_check (by decide) success fork
++  obtain ⟨c1⟩ := SolcSignedQuery.selector_gt_succ c0 cert_check (by decide) success fork
++  obtain ⟨o2⟩ := c1.destH cert_check success fork.stateGas
++  obtain ⟨c2⟩ := SolcSignedQuery.selector_gt_succ o2 cert_check (by decide) success fork
++  obtain ⟨o3⟩ := c2.destH cert_check success fork.stateGas
++  obtain ⟨c3⟩ := SolcSignedQuery.selector_eq_zero o3 cert_check (by decide) success fork
++  obtain ⟨c4⟩ := SolcSignedQuery.selector_eq_zero c3 cert_check (by decide) success fork
++  obtain ⟨c5⟩ := SolcSignedQuery.selector_eq_zero c4 cert_check (by decide) success fork
++  exact SolcSignedQuery.selector_eq_succ c5 cert_check (by decide) rfl success fork
++
++private theorem role_word :
++    Bytes.toB256 [0xe9, 0x5e, 0x22, 0xec, 0x6d, 0xbf, 0x4c, 0x91, 0x1d, 0x1f, 0xae, 0x59, 0x68,
++      0x0a, 0x3e, 0x9c, 0xb7, 0x1d, 0xd3, 0x5b, 0x3a, 0x1c, 0x69, 0x7d, 0x23, 0x2e, 0x4b, 0x01,
++      0xa8, 0xff, 0x30, 0xa2] = tokenPauserRole := by decide
++
++/-- `pause()` → `onlyRole(TOKEN_PAUSER_ROLE)` → `_checkRole(role)` → `_checkRole(role, caller)`. -/
++private theorem enter_check {F : Exec.Deriv} {post : Devm} {M : Mem}
++    (cut : CursorStateAt code cert F t_03ca_c162 F.devm [pauseSelector] M [])
++    (success : F.exn = .ok post) (hsg : F.sevm.benvStat.rules.stateGas = none) :
++    ∃ S, Nonempty (CursorStateAt code cert F t_1e60_c119 F.devm
++      (F.sevm.caller.toB256 :: tokenPauserRole :: S) M
++      [t_07e4_c88, t_10b1_c54, t_0252_c162]) := by
++  obtain ⟨o162⟩ := cut.destH cert_check success hsg
++  obtain ⟨l162⟩ := o162.lineH cert_check success hsg
++    [.push [0x02, 0x52] (by decide), .push [0x10, 0x87] (by decide)] rfl
++    (by intro ni member xi same; subst ni
++        simp only [List.mem_cons, List.not_mem_nil, reduceCtorEq, or_self] at member)
++    (by intro G d run
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        cases run
++        exact ⟨_, rfl⟩)
++  obtain ⟨e54⟩ := l162.callH (g := t_1087_c54) cert_check success hsg rfl
++  obtain ⟨o54⟩ := e54.destH cert_check success hsg
++  obtain ⟨l54⟩ := o54.lineH cert_check success hsg
++    [.push [0xe9, 0x5e, 0x22, 0xec, 0x6d, 0xbf, 0x4c, 0x91, 0x1d, 0x1f, 0xae, 0x59, 0x68, 0x0a,
++      0x3e, 0x9c, 0xb7, 0x1d, 0xd3, 0x5b, 0x3a, 0x1c, 0x69, 0x7d, 0x23, 0x2e, 0x4b, 0x01, 0xa8,
++      0xff, 0x30, 0xa2] (by decide), .push [0x10, 0xb1] (by decide), .reg (.dup 1),
++      .push [0x19, 0x54] (by decide)] rfl
++    (by intro ni member xi same; subst ni
++        simp only [List.mem_cons, List.not_mem_nil, reduceCtorEq, or_self] at member)
++    (by intro G d run
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_dup rfl step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        cases run
++        rw [role_word]
++        exact ⟨_, rfl⟩)
++  obtain ⟨e88⟩ := l54.callH (g := t_1954_c88) cert_check success hsg rfl
++  obtain ⟨o88⟩ := e88.destH cert_check success hsg
++  obtain ⟨l88⟩ := o88.lineH cert_check success hsg
++    [.push [0x07, 0xe4] (by decide), .reg (.dup 1), .reg .caller, .push [0x1e, 0x60] (by decide)] rfl
++    (by intro ni member xi same; subst ni
++        simp only [List.mem_cons, List.not_mem_nil, reduceCtorEq, or_self] at member)
++    (by intro G d run
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_dup rfl step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_caller step
++        obtain ⟨_, step, run⟩ := Line.of_run_cons run
++        obtain ⟨_, rfl⟩ := ri_push step
++        cases run
++        exact ⟨_, rfl⟩)
++  exact ⟨_, l88.callH (g := t_1e60_c119) cert_check success hsg rfl⟩
++
++/-! ## The query, the decoder and the branch after it -/
++
++private theorem not_slt_of_sltCheck {x y : B256} (h : B256.sltCheck x y = 0) :
++    ¬ B256.Slt x y := by
++  intro lt
++  unfold B256.sltCheck at h
++  split at h
++  · exact absurd h (by decide)
++  · contradiction
++
++/-- Entry 119 up to the reply: the `STATICCALL` was answered by the registry (the failed-call
++branch reverts), and the run goes on at the reply handler with the reply written at the free
++pointer. -/
++private theorem query_called {P : Sevm → Devm → Ninst → Devm → Prop}
++    (project : ∀ {s d i d'}, P s d i d' → Ninst.Run s d i d')
++    {sevm : Sevm} {b : Devm} {A R : B256} {S : List B256} {M : Mem} {I : Bytes} {G : Nat}
++    {o : Outcome} (fork : CoveredFork sevm.benvStat.fork)
++    (reads : Mem.Reads M I) (wf : Mem.Wf M) (ptr : I.sliceD 64 32 0 = (128 : B256).toBytes)
++    (run : SFunc.RunP P cert.prog sevm (St b (A :: R :: S) M G) t_1e60_c119 o) :
++    ∃ (out : Bytes) (d : Devm) (x0 x1 x2 x3 : B256) (M' : Mem) (I' : Bytes) (G' : Nat),
++      StaticAnswered sevm b registry
++        ([0x91, 0xd1, 0x48, 0x54] ++ R.toBytes ++ A.toAdr.toB256.toBytes) out ∧
++      out.length < 2 ^ 256 ∧ d.returnData = out ∧
++      Mem.Reads M' I' ∧ Mem.Wf M' ∧ I'.sliceD 64 32 0 = (128 : B256).toBytes ∧
++      ((out.take 32).length = 32 → I'.sliceD 128 32 0 = out.take 32) ∧
++      SFunc.RunP P cert.prog sevm (St d (x0 :: x1 :: x2 :: x3 :: A :: R :: S) M' G')
++        t_1ecb_c119 o := by
++  rw [entry119_shape] at run
++  obtain ⟨_, run⟩ := rpw_dest run
++  obtain ⟨_, line, run⟩ := rpw_nexts project queryLine run
++  obtain ⟨gw, t, ii, is, os, e, s, M1, I1, G1, rfl, ht, rfl, rfl, rfl, r1, w1, p1, data⟩ :=
++    query_line reads wf ptr line
++  obtain ⟨d2, call, run⟩ := rpw_next run
++  obtain ⟨flag, out, post, bound, answered⟩ := ri_staticcall_bounded fork (project call)
++  rw [post.eq_St] at run
++  obtain ⟨_, line, run⟩ := rpw_nexts project flagLine run
++  obtain ⟨_, rfl⟩ := flag_line line
++  rcases rpw_branch run with ⟨_, _, dead⟩ | ⟨accepted, _, run⟩
++  · exact (rpw_dead rfl dead).elim
++  have flagOne : flag = 1 := by
++    rcases post.flag with zero | one
++    · subst zero
++      exact absurd (by decide : B256.eqCheck (B256.eqCheck (0 : B256) 0) 0 = 0) accepted
++    · exact one
++  have n128 : (128 : B256).toNat = 128 := by decide
++  have n68 : (68 : B256).toNat = 68 := by decide
++  have n32 : (32 : B256).toNat = 32 := by decide
++  have asked := answered flagOne
++  rw [ht, r1.read, n128, n68, data] at asked
++  refine ⟨out, d2, _, _, _, _, _, _, _, asked, bound, post.returnData,
++    (r1.extends _).write (Mem.Wf.extends _ w1) _ _, Mem.Wf.write (Mem.Wf.extends _ w1) _ _,
++    ?_, ?_, run⟩
++  · rw [Bytes.sliceD_writeAt_before _ _ _ _ _ (by rw [n128]; omega), p1]
++  · intro takeLen
++    have back := Bytes.sliceD_writeAt I1 (out.take 32) 128
++    rw [takeLen] at back
++    rw [n128, n32, back]
++
++/-- The ABI `bool` decoder (entries 83 and 18), called on `[0x80, 0x80 + returndatasize)`:
++a returning run checked the length and that the word read is `0` or `1`, and returns it. -/
++private theorem decoder_returned {P : Sevm → Devm → Ninst → Devm → Prop}
++    (project : ∀ {s d i d'}, P s d i d' → Ninst.Run s d i d')
++    {sevm : Sevm} {b D : Devm} {n ret : B256} {S : List B256} {M : Mem} {G : Nat}
++    (run : SFunc.RunP P cert.prog sevm (St b (128 :: (128 + n) :: ret :: S) M G) t_29f1_c83
++      (.returned D)) :
++    ¬ B256.Slt n (Bytes.toB256 [0x20]) ∧
++      B256.eqCheck (Bytes.toB256 (M.read (128 : B256).toNat 32).1)
++        (B256.eqCheck (B256.eqCheck (Bytes.toB256 (M.read (128 : B256).toNat 32).1) 0) 0) ≠ 0 ∧
++      ∃ G', D = St b (Bytes.toB256 (M.read (128 : B256).toNat 32).1 :: S)
++        (M.read (128 : B256).toNat 32).2 G' := by
++  rw [length_shape] at run
++  obtain ⟨_, run⟩ := rpw_dest run
++  obtain ⟨_, line, run⟩ := rpw_nexts project lengthLine run
++  obtain ⟨_, rfl⟩ := length_line line
++  rcases rpw_branch run with ⟨_, _, dead⟩ | ⟨longEnough, _, run⟩
++  · exact (rpw_dead rfl dead).elim
++  have sltZero := B256.eqCheck_ne_zero_iff.mp longEnough
++  rw [add_sub_cancel_left'] at sltZero
++  rw [bool_shape] at run
++  obtain ⟨_, run⟩ := rpw_dest run
++  obtain ⟨_, line, run⟩ := rpw_nexts project boolLine run
++  obtain ⟨_, rfl⟩ := bool_line line
++  rcases rpw_branchTo run with ⟨_, _, dead⟩ | ⟨isBool, g, _, entry18, run⟩
++  · exact (rpw_dead rfl dead).elim
++  rw [show cert.prog[18]? = some t_1a1b_c18 from rfl] at entry18
++  cases entry18
++  rw [unwind_shape] at run
++  obtain ⟨_, run⟩ := rpw_dest run
++  obtain ⟨_, line, run⟩ := rpw_nexts project unwindLine run
++  obtain ⟨_, rfl⟩ := unwind_line line
++  exact ⟨not_slt_of_sltCheck sltZero, isBool, rpw_ret run⟩
++
++/-- The reply handler of entry 119: a run that does not revert saw at least 32 returned bytes and
++a first word `1`. -/
++private theorem reply_checked {P : Sevm → Devm → Ninst → Devm → Prop}
++    (project : ∀ {s d i d'}, P s d i d' → Ninst.Run s d i d')
++    {sevm : Sevm} {d : Devm} {x0 x1 x2 x3 A R : B256} {S : List B256} {M : Mem} {I : Bytes}
++    {G : Nat} {o : Outcome} {out : Bytes}
++    (returned : d.returnData = out) (bound : out.length < 2 ^ 256)
++    (reads : Mem.Reads M I) (wf : Mem.Wf M) (ptr : I.sliceD 64 32 0 = (128 : B256).toBytes)
++    (reply : (out.take 32).length = 32 → I.sliceD 128 32 0 = out.take 32)
++    (run : SFunc.RunP P cert.prog sevm (St d (x0 :: x1 :: x2 :: x3 :: A :: R :: S) M G)
++      t_1ecb_c119 o) :
++    32 ≤ out.length ∧ Bytes.toB256 (out.take 32) = 1 := by
++  rw [reply_shape] at run
++  obtain ⟨_, run⟩ := rpw_dest run
++  obtain ⟨_, line, run⟩ := rpw_nexts project replyLine run
++  obtain ⟨M4, I4, G4, rfl, r4, w4, p4⟩ := reply_line reads wf ptr line
++  rw [returned] at run
++  obtain ⟨_, D, callee, run⟩ :=
++    rpw_callOver (S' := [83, 18]) (g := t_29f1_c83) (by decide +kernel) rfl (by decide) run
++  obtain ⟨notShort, isBool, G5, rfl⟩ := decoder_returned project callee
++  rw [verdict_shape] at run
++  obtain ⟨_, run⟩ := rpw_dest run
++  obtain ⟨_, step, run⟩ := rpw_next run
++  obtain ⟨_, rfl⟩ := ri_push (project step)
++  rcases rpw_branchTo run with ⟨_, _, rejected⟩ | ⟨granted, _, _, _, _⟩
++  · exact (rpw_jumpsDead rejected (by decide +kernel)).elim
++  have long : 32 ≤ out.length := by
++    have := le_toNat_of_not_slt notShort
++    rwa [B256.toNat_toB256_of_lt bound] at this
++  have takeLen : (out.take 32).length = 32 := by
++    rw [List.length_take]
++    omega
++  have n128 : (128 : B256).toNat = 128 := by decide
++  have word : Bytes.toB256 (M4.read (128 : B256).toNat 32).1 = Bytes.toB256 (out.take 32) := by
++    rw [r4.read, n128, p4, reply takeLen]
++  rw [word] at granted isBool
++  exact ⟨long, eq_one_of_bool granted isBool⟩
++
++/-- From entry 119 with `account :: role` on the stack and the free pointer at `0x80`, every run
++that does not revert asked the registry `hasRole(role, account)` and was answered with a word
++`1`. -/
++theorem query_answered {P : Sevm → Devm → Ninst → Devm → Prop}
++    (project : ∀ {s d i d'}, P s d i d' → Ninst.Run s d i d')
++    {sevm : Sevm} {b : Devm} {A R : B256} {S : List B256} {M : Mem} {I : Bytes} {G : Nat}
++    {o : Outcome} (fork : CoveredFork sevm.benvStat.fork)
++    (reads : Mem.Reads M I) (wf : Mem.Wf M) (ptr : I.sliceD 64 32 0 = (128 : B256).toBytes)
++    (run : SFunc.RunP P cert.prog sevm (St b (A :: R :: S) M G) t_1e60_c119 o) :
++    ∃ out, StaticAnswered sevm b registry
++        ([0x91, 0xd1, 0x48, 0x54] ++ R.toBytes ++ A.toAdr.toB256.toBytes) out ∧
++      32 ≤ out.length ∧ Bytes.toB256 (out.take 32) = 1 := by
++  obtain ⟨out, d, _, _, _, _, _, _, _, asked, bound, returned, r, w, p, reply, run⟩ :=
++    query_called project fork reads wf ptr run
++  exact ⟨out, asked, reply_checked project returned bound r w p reply run⟩
++
++/-- **`pause()` requires the pauser role.**  For every state, environment, caller and registry
++code: if a run of Stock's deployed bytes with selector `pause()` succeeds, it made a successful
++`STATICCALL` to the registry with calldata `hasRole(TOKEN_PAUSER_ROLE, caller)` over the frame's
++starting world, and the registry returned at least 32 bytes whose first word is `1`. -/
++theorem pause_requires_role {F : Exec.Deriv} {post : Devm}
++    (pc : F.pc = 0) (onCode : F.sevm.code = code)
++    (stack : F.devm.stack = []) (memory : F.devm.memory = Mem.empty)
++    (selector : Sevm.selector F.sevm = pauseSelector)
++    (success : F.exn = .ok post) (fork : CoveredFork F.sevm.benvStat.fork) :
++    ∃ out : Bytes,
++      StaticAnswered F.sevm F.devm registry (hasRoleData tokenPauserRole F.sevm.caller) out ∧
++      32 ≤ out.length ∧ Bytes.toB256 (out.take 32) = 1 := by
++  have neutral := fork.histFork.neutral
++  obtain ⟨atPause⟩ := root_pause pc onCode stack memory selector success neutral
++  obtain ⟨S, ⟨atQuery⟩⟩ := enter_check atPause success neutral.stateGas
++  obtain ⟨G, state⟩ := atQuery.state
++  obtain ⟨outcome, run⟩ := atQuery.placed.sourceRunH cert_check (atQuery.exn_eq.trans success)
++    (by rw [atQuery.sevm_eq]; exact neutral.stateGas)
++  rw [atQuery.tree, state, atQuery.sevm_eq] at run
++  have reads : Mem.Reads freeMem (Bytes.writeAt [] 64 (128 : B256).toBytes) :=
++    Mem.reads_empty.write Mem.wf_empty 64 _
++  have wf : Mem.Wf freeMem := Mem.Wf.write Mem.wf_empty 64 _
++  have ptr : (Bytes.writeAt [] 64 (128 : B256).toBytes).sliceD 64 32 0 = (128 : B256).toBytes := by
++    decide
++  obtain ⟨out, answered, long, one⟩ :=
++    query_answered (fun h => StepIn.toRun h) fork reads wf ptr run
++  refine ⟨out, ?_, long, one⟩
++  simpa only [hasRoleData, toAdr_toB256] using answered
++
++end Blanc.Lift.Stock
+-- 
+2.50.1 (Apple Git-155)
+

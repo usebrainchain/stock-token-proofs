@@ -1,0 +1,4 @@
+[global]
+loop = 2
+default-bytes-lengths = "0,31,65"
+solver-timeout-assertion = "120s"

@@ -1,0 +1,26 @@
+id	property	file	change
+M01	P1	Stock.sol	mint credits one unit more than requested
+M02	P1	Stock.sol	adminBurn moves the tokens to the token contract instead of burning them
+M03	P1	Stock.sol	every non-zero transfer also inflates totalSupply by one unit
+M04	P2	Stock.sol	transfer no longer checks the recipient against the blocklist
+M05	P2	Stock.sol	transferFrom no longer checks the spender (caller) against the blocklist
+M06	P2	Stock.sol	burn no longer checks the holder against the blocklist
+M07	P2	Stock.sol	approve no longer checks the spender against the blocklist
+M08	P2	Stock.sol	adminBurn refuses blocked holders (it must reach them)
+M09	P3	Stock.sol	transfer ignores the pause
+M10	P3	Stock.sol	paused() ignores the registry pause
+M11	P3	Stock.sol	adminBurn is stopped by the pause (it must stay available)
+M12	P3	Stock.sol	permit ignores the pause
+M13	P4	ERC20ScaledUIUpgradeable.sol	a scheduled multiplier applies one second after its time
+M14	P4	ERC20ScaledUIUpgradeable.sol	rescheduling does not save the multiplier in force, so a matured value is lost
+M15	P4	ERC20ScaledUIUpgradeable.sol	updateMultiplier accepts zero
+M16	P4	ERC20ScaledUIUpgradeable.sol	an unset multiplier reads as zero instead of 1.0
+M17	P4	Stock.sol	the immediate multiplier update also rescales the raw totalSupply
+M18	P5	Stock.sol	setMetadata has no role check
+M19	P5	Stock.sol	pauseOracle checks TOKEN_PAUSER_ROLE instead of ORACLE_PAUSER_ROLE
+M20	P5	Stock.sol	adminBurn accepts BURNER_ROLE
+M21	P6	Stock.sol	the implementation constructor no longer disables initializers
+M22	P6	Stock.sol	initialize is a reinitializer keyed on the uid, so a proxy can be initialised again
+M23	P7	Stock.sol	transferFrom does not spend the allowance
+M24	P7	Stock.sol	an infinite (2^256-1) allowance is spent like a finite one
+M25	P7	Stock.sol	transfers skim one unit to a third account

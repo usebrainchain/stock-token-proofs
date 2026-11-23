@@ -1,0 +1,38 @@
+From 3d9bc9e82301c0490bd7efd2d2a4e0527bb5ed35 Mon Sep 17 00:00:00 2001
+From: brainchaindev <hello@usebrainchain.com>
+Date: Mon, 23 Nov 2026 16:10:54 +0000
+Subject: [PATCH 04/11] import the stock modules into the library root
+
+---
+ Blanc.lean | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/Blanc.lean b/Blanc.lean
+index a2356c0..c6591b4 100644
+--- a/Blanc.lean
++++ b/Blanc.lean
+@@ -1132,6 +1132,21 @@ import Blanc.Lift.StaticOnlyPrefix
+ import Blanc.Lift.StaticOnlyRoots
+ import Blanc.Lift.StepMemory
+ import Blanc.Lift.StepTops
++import Blanc.Lift.Stock.Cert
++import Blanc.Lift.Stock.Check
++import Blanc.Lift.Stock.CheckPart0
++import Blanc.Lift.Stock.CheckPart1
++import Blanc.Lift.Stock.CheckPart2
++import Blanc.Lift.Stock.CheckPart3
++import Blanc.Lift.Stock.CheckTries
++import Blanc.Lift.Stock.Jumps
++import Blanc.Lift.Stock.Pause
++import Blanc.Lift.StockWs.Ann
++import Blanc.Lift.StockWs.Check
++import Blanc.Lift.StockWs.Check0
++import Blanc.Lift.StockWs.Check1
++import Blanc.Lift.StockWs.Check2
++import Blanc.Lift.StockWs.Check3
+ import Blanc.Lift.SymTransfer
+ import Blanc.Lift.SystemCallAmsterdam
+ import Blanc.Lift.SystemCaller
+-- 
+2.50.1 (Apple Git-155)
+

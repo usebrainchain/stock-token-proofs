@@ -1,0 +1,27 @@
+From e92f7c75cd245d338922b37ba4847fd787658216 Mon Sep 17 00:00:00 2001
+From: brainchaindev <hello@usebrainchain.com>
+Date: Mon, 23 Nov 2026 16:33:32 +0000
+Subject: [PATCH 05/11] regenerate the leaf count with the stock theorems
+
+---
+ scripts/leaf-count.json | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/scripts/leaf-count.json b/scripts/leaf-count.json
+index eded9f6..4416b3f 100644
+--- a/scripts/leaf-count.json
++++ b/scripts/leaf-count.json
+@@ -1,7 +1,7 @@
+ {
+  "generator": "python3 scripts/leaf_audit.py generate",
+- "leaves": 2334,
+- "private": 46,
+- "public": 2288,
++ "leaves": 2338,
++ "private": 47,
++ "public": 2291,
+  "schema": 1
+ }
+-- 
+2.50.1 (Apple Git-155)
+

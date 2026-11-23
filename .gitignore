@@ -1,0 +1,8 @@
+/work/
+tests/out/
+tests/cache/
+tests/logs/
+tests/mutants/.work/
+.DS_Store
+tests/controls/*/out/
+tests/controls/*/cache/
